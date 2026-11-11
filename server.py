@@ -36,6 +36,11 @@ def user():
         collection('users').document(email).set(u)
     else: raise PermissionError('Account is not provisioned in TEST')
     u['email']=email
+    # Existing bootstrap users also receive these defaults; other employees
+    # use their configured Firestore user profile values.
+    if email==BOOTSTRAP_ADMIN:
+        u.setdefault('homeStore','Glencoe')
+        u.setdefault('dmsInitials','ZK1')
     return u
 
 def visible(u,r):
@@ -78,8 +83,13 @@ def create():
     id=f'{datetime.datetime.now().year%100:02d}-{seq:05d}'
     status='Blank Printed' if body['mode']=='blank' else 'Draft'
     locations=u.get('locations',[])
-    store=locations[0] if len(locations)==1 else ''
-    r={'id':id,'status':status,'form':body['form'],'formName':str(body.get('formName',''))[:250], 'version':1,'salesEmail':u['email'],'salesName':u.get('name',u['email']),'initials':'','store':store,'created':now,'updated':now,'serial':'','make':'','model':'','customer':'','stock':'','data':{'salesinitials':'','location':store},'revisions':0,'audit':[{'at':now,'by':u['email'],'action':'BLANK_PRINTED' if body['mode']=='blank' else 'CREATED'}]}
+    store=u.get('homeStore','')
+    if store not in STORES or (u['role']!='System Admin' and store not in locations):
+        store=locations[0] if len(locations)==1 else ''
+    if not store:
+        return fail('Set a valid home store in the employee profile before creating an appraisal')
+    initials=str(u.get('dmsInitials','')).strip()[:20]
+    r={'id':id,'status':status,'form':body['form'],'formName':str(body.get('formName',''))[:250], 'version':1,'salesEmail':u['email'],'salesName':u.get('name',u['email']),'initials':initials,'store':store,'created':now,'updated':now,'serial':'','make':'','model':'','customer':'','stock':'','data':{'salesinitials':initials,'location':store},'revisions':0,'audit':[{'at':now,'by':u['email'],'action':'BLANK_PRINTED' if body['mode']=='blank' else 'CREATED'}]}
     collection('records').document(id).create(r)
     return jsonify(record=r),201
 
