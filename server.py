@@ -1,8 +1,11 @@
-import os, re, datetime
+import os, re, datetime, io, json, hashlib, mimetypes
 from flask import Flask, request, jsonify, send_from_directory
 from google.cloud import firestore
 from google.auth.transport.requests import Request
 from google.oauth2 import id_token
+from google.auth import default as google_auth_default
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
 
 app=Flask(__name__,static_folder=None)
 client=firestore.Client()
@@ -127,6 +130,108 @@ def update(record_id):
         return old
     try:return jsonify(record=apply(client.transaction()))
     except ValueError as e:return fail(str(e))
+
+
+# TEST-only destination. Set to the ID of the EXISTING "TEST - Equipment Appraisals" folder.
+DRIVE_ROOT_FOLDER_ID=os.environ.get('DRIVE_TEST_FOLDER_ID','').strip()
+MAX_EXPORT_BYTES=28*1024*1024
+
+def drive_service():
+    if not DRIVE_ROOT_FOLDER_ID:
+        raise RuntimeError('DRIVE_TEST_FOLDER_ID is not configured')
+    credentials,_=google_auth_default(scopes=['https://www.googleapis.com/auth/drive'])
+    return build('drive','v3',credentials=credentials,cache_discovery=False)
+
+def drive_child(service,parent,name):
+    escaped=name.replace("'", "\\'")
+    result=service.files().list(q=f"'{parent}' in parents and name = '{escaped}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false",fields='files(id,name),nextPageToken',page_size=100,supportsAllDrives=True,includeItemsFromAllDrives=True).execute()
+    if result.get('files'): return result['files'][0]['id']
+    obj=service.files().create(body={'name':name,'mimeType':'application/vnd.google-apps.folder','parents':[parent]},fields='id',supportsAllDrives=True).execute()
+    return obj['id']
+
+def drive_upload(service,parent,name,data,mime):
+    # A retry replaces only the same revision's file, avoiding duplicate exports.
+    escaped=name.replace("'", "\\'")
+    found=service.files().list(q=f"'{parent}' in parents and name = '{escaped}' and trashed = false",fields='files(id,name)',page_size=100,supportsAllDrives=True,includeItemsFromAllDrives=True).execute().get('files',[])
+    media=MediaIoBaseUpload(io.BytesIO(data),mimetype=mime,resumable=False)
+    if found:
+        return service.files().update(fileId=found[0]['id'],media_body=media,fields='id,webViewLink',supportsAllDrives=True).execute()
+    return service.files().create(body={'name':name,'parents':[parent]},media_body=media,fields='id,webViewLink',supportsAllDrives=True).execute()
+
+@app.post('/api/records/<record_id>/drive-export')
+def export_submitted(record_id):
+    u=user()
+    if not re.fullmatch(r'\d{2}-\d{5,}',record_id):return fail('Invalid appraisal number')
+    snap=collection('records').document(record_id).get()
+    if not snap.exists:return fail('Appraisal not found',404)
+    r=snap.to_dict()
+    if not visible(u,r):raise PermissionError('Not allowed to view this appraisal')
+    if not editable(u,r):raise PermissionError('Not allowed to export this appraisal')
+    if r.get('status')!='Submitted':return fail('Only submitted appraisals can be exported')
+    if not DRIVE_ROOT_FOLDER_ID:return fail('TEST Google Drive destination has not been configured',503)
+    try:
+        revision=int(request.form.get('revision','-1'))
+        if revision!=int(r.get('revisions',0)):return fail('Appraisal revision changed; reopen and retry export',409)
+        clean=request.files.get('appraisal_only')
+        combined=request.files.get('complete_appraisal')
+        if not clean or not combined:return fail('Both appraisal PDFs are required')
+        clean_bytes=clean.read(); combined_bytes=combined.read()
+        if not clean_bytes.startswith(b'%PDF-') or not combined_bytes.startswith(b'%PDF-'):return fail('Invalid PDF file')
+        entries=[]
+        for f in request.files.getlist('photos'):
+            raw=f.read();mime=f.mimetype or ''
+            if not mime.startswith('image/') or not raw:return fail('Invalid equipment photo')
+            entries.append((f,raw,mime))
+        for f in request.files.getlist('internal_photos'):
+            raw=f.read();mime=f.mimetype or ''
+            if not mime.startswith('image/') or not raw:return fail('Invalid internal photo')
+            entries.append((f,raw,mime))
+        for f in request.files.getlist('supporting_documents'):
+            raw=f.read();mime=f.mimetype or ''
+            if not (mime.startswith('image/') or mime=='application/pdf') or not raw:return fail('Invalid supporting document')
+            entries.append((f,raw,mime))
+        total=len(clean_bytes)+len(combined_bytes)+sum(len(raw) for _,raw,_ in entries)
+        if total>MAX_EXPORT_BYTES:return fail('Export exceeds 28 MB. Reduce photo sizes and retry.',413)
+        if len(entries)>70:return fail('Too many attachments')
+        # Do not overwrite prior exports; a unique revision folder preserves history.
+        service=drive_service()
+        store=r.get('store')
+        if store not in STORES:return fail('Invalid appraisal store')
+        year='20'+record_id[:2]
+        parent=drive_child(service,DRIVE_ROOT_FOLDER_ID,store)
+        parent=drive_child(service,parent,year)
+        parent=drive_child(service,parent,record_id)
+        revision_name='Revision '+str(revision)
+        # An existing revision folder is reused on retry, but each upload creates
+        # a new file. This prevents silent replacement of a prior document.
+        rev_folder=drive_child(service,parent,revision_name)
+        drive_upload(service,rev_folder,f'{record_id} - Appraisal Only.pdf',clean_bytes,'application/pdf')
+        drive_upload(service,rev_folder,f'{record_id} - Complete Appraisal.pdf',combined_bytes,'application/pdf')
+        photos_folder=drive_child(service,rev_folder,'Photos')
+        internal_folder=None
+        support_folder=None
+        for category in ('photos','internal_photos','supporting_documents'):
+            for i,f in enumerate(request.files.getlist(category),1):
+                # Safe, stable names; never use untrusted path fragments.
+                extension=os.path.splitext(f.filename or '')[1].lower()
+                if extension not in ('.jpg','.jpeg','.png','.webp','.heic','.pdf'):
+                    extension='.pdf' if f.mimetype=='application/pdf' else '.jpg'
+                if category=='photos':dest=photos_folder
+                elif category=='internal_photos':
+                    if internal_folder is None:internal_folder=drive_child(service,rev_folder,'Internal Photos - Restricted')
+                    dest=internal_folder
+                else:
+                    if support_folder is None:support_folder=drive_child(service,rev_folder,'Supporting Documents - Restricted')
+                    dest=support_folder
+                # Same bytes were validated above; file pointers reset after read.
+                f.stream.seek(0)
+                drive_upload(service,dest,f'{category}-{i:02d}{extension}',f.read(),f.mimetype or 'application/octet-stream')
+        link='https://drive.google.com/drive/folders/'+parent
+        collection('records').document(record_id).update({'driveExport':{'revision':revision,'folderId':parent,'revisionFolderId':rev_folder,'url':link,'exportedAt':datetime.datetime.now(datetime.timezone.utc).isoformat(),'exportedBy':u['email']}})
+        return jsonify(ok=True,folderUrl=link,revision=revision)
+    except Exception:
+        app.logger.exception('Google Drive export failed for %s',record_id)
+        return fail('Google Drive export failed. Appraisal remains submitted in Firestore. Retry export from the appraisal page.',502)
 
 @app.get('/api/health')
 def health():return jsonify(status='ok',environment='TEST')
