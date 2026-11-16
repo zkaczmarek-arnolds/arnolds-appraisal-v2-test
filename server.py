@@ -3,7 +3,7 @@ from flask import Flask, request, jsonify, send_from_directory
 from google.cloud import firestore
 from google.auth.transport.requests import Request
 from google.oauth2 import id_token
-from google.auth import default as google_auth_default
+from google.oauth2.credentials import Credentials as OAuthCredentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
@@ -137,9 +137,32 @@ DRIVE_ROOT_FOLDER_ID=os.environ.get('DRIVE_TEST_FOLDER_ID','').strip()
 MAX_EXPORT_BYTES=28*1024*1024
 
 def drive_service():
+    """Use the dedicated Workspace user's OAuth refresh token from Secret Manager.
+
+    Secret JSON is mounted as an environment variable by Cloud Run. Never log it.
+    The dedicated account should have access only to the TEST folder.
+    """
     if not DRIVE_ROOT_FOLDER_ID:
         raise RuntimeError('DRIVE_TEST_FOLDER_ID is not configured')
-    credentials,_=google_auth_default(scopes=['https://www.googleapis.com/auth/drive'])
+    secret=os.environ.get('DRIVE_OAUTH_CREDENTIALS_JSON','').strip()
+    if not secret:
+        raise RuntimeError('DRIVE_OAUTH_CREDENTIALS_JSON secret is not configured')
+    try:
+        config=json.loads(secret)
+        required=('client_id','client_secret','refresh_token')
+        if not all(config.get(k) for k in required):
+            raise ValueError('OAuth credentials are missing required fields')
+        credentials=OAuthCredentials(
+            token=None,
+            refresh_token=config['refresh_token'],
+            token_uri='https://oauth2.googleapis.com/token',
+            client_id=config['client_id'],
+            client_secret=config['client_secret'],
+            scopes=['https://www.googleapis.com/auth/drive'],
+        )
+        credentials.refresh(Request())
+    except Exception as exc:
+        raise RuntimeError('Google Drive OAuth credentials could not be refreshed') from exc
     return build('drive','v3',credentials=credentials,cache_discovery=False)
 
 def drive_child(service,parent,name):
