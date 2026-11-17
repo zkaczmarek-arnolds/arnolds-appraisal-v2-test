@@ -144,9 +144,9 @@ def drive_service():
     """
     if not DRIVE_ROOT_FOLDER_ID:
         raise RuntimeError('DRIVE_TEST_FOLDER_ID is not configured')
-    secret=os.environ.get('DRIVE_OAUTH_CREDENTIALS_JSON','').strip()
+    secret=(os.environ.get('GOOGLE_OAUTH_SECRET_JSON') or os.environ.get('DRIVE_OAUTH_CREDENTIALS_JSON') or '').strip()
     if not secret:
-        raise RuntimeError('DRIVE_OAUTH_CREDENTIALS_JSON secret is not configured')
+        raise RuntimeError('GOOGLE_OAUTH_SECRET_JSON secret is not configured')
     try:
         config=json.loads(secret)
         required=('client_id','client_secret','refresh_token')
