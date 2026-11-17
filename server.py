@@ -167,7 +167,7 @@ def drive_service():
 
 def drive_child(service,parent,name):
     escaped=name.replace("'", "\\'")
-    result=service.files().list(q=f"'{parent}' in parents and name = '{escaped}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false",fields='files(id,name),nextPageToken',page_size=100,supportsAllDrives=True,includeItemsFromAllDrives=True).execute()
+    result=service.files().list(q=f"'{parent}' in parents and name = '{escaped}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false",fields='files(id,name),nextPageToken',pageSize=100,supportsAllDrives=True,includeItemsFromAllDrives=True).execute()
     if result.get('files'): return result['files'][0]['id']
     obj=service.files().create(body={'name':name,'mimeType':'application/vnd.google-apps.folder','parents':[parent]},fields='id',supportsAllDrives=True).execute()
     return obj['id']
@@ -175,7 +175,7 @@ def drive_child(service,parent,name):
 def drive_upload(service,parent,name,data,mime):
     # A retry replaces only the same revision's file, avoiding duplicate exports.
     escaped=name.replace("'", "\\'")
-    found=service.files().list(q=f"'{parent}' in parents and name = '{escaped}' and trashed = false",fields='files(id,name)',page_size=100,supportsAllDrives=True,includeItemsFromAllDrives=True).execute().get('files',[])
+    found=service.files().list(q=f"'{parent}' in parents and name = '{escaped}' and trashed = false",fields='files(id,name)',pageSize=100,supportsAllDrives=True,includeItemsFromAllDrives=True).execute().get('files',[])
     media=MediaIoBaseUpload(io.BytesIO(data),mimetype=mime,resumable=False)
     if found:
         return service.files().update(fileId=found[0]['id'],media_body=media,fields='id,webViewLink',supportsAllDrives=True).execute()
