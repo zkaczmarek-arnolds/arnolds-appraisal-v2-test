@@ -216,41 +216,77 @@ def export_submitted(record_id):
         total=len(clean_bytes)+len(combined_bytes)+sum(len(raw) for _,raw,_ in entries)
         if total>MAX_EXPORT_BYTES:return fail('Export exceeds 28 MB. Reduce photo sizes and retry.',413)
         if len(entries)>70:return fail('Too many attachments')
-        # Do not overwrite prior exports; a unique revision folder preserves history.
+        # TEST folder layout: Store / Salesperson - Initials / ID - Make Model.
+        # Latest export lives at the appraisal root; older submissions are archived.
         service=drive_service()
         store=r.get('store')
         if store not in STORES:return fail('Invalid appraisal store')
-        year='20'+record_id[:2]
-        parent=drive_child(service,DRIVE_ROOT_FOLDER_ID,store)
-        parent=drive_child(service,parent,year)
-        parent=drive_child(service,parent,record_id)
-        revision_name='Revision '+str(revision)
-        # An existing revision folder is reused on retry, but each upload creates
-        # a new file. This prevents silent replacement of a prior document.
-        rev_folder=drive_child(service,parent,revision_name)
-        drive_upload(service,rev_folder,f'{record_id} - Appraisal Only.pdf',clean_bytes,'application/pdf')
-        drive_upload(service,rev_folder,f'{record_id} - Complete Appraisal.pdf',combined_bytes,'application/pdf')
-        photos_folder=drive_child(service,rev_folder,'Photos')
+        def safe_name(value, fallback, limit=90):
+            value=re.sub(r'[\\/<>:"|?*\x00-\x1f]+',' ',str(value or '')).strip(' .')
+            return (value[:limit].strip(' .') or fallback)
+        salesperson=safe_name(r.get('salesName') or r.get('salesEmail'),'Unknown Salesperson')
+        initials=safe_name(r.get('initials') or (r.get('data') or {}).get('salesinitials'),'No Initials',20)
+        equipment=' '.join(x for x in (safe_name(r.get('make'),'',45),safe_name(r.get('model'),'',45)) if x).strip()
+        appraisal_name=record_id+(' - '+equipment if equipment else '')
+        store_folder=drive_child(service,DRIVE_ROOT_FOLDER_ID,store)
+        sales_folder=drive_child(service,store_folder,salesperson+' - '+initials)
+        parent=drive_child(service,sales_folder,appraisal_name)
+
+        def list_children(folder):
+            found=[];page=None
+            while True:
+                args=dict(q=f"'{folder}' in parents and trashed = false",fields='nextPageToken,files(id,name,mimeType)',pageSize=100,supportsAllDrives=True,includeItemsFromAllDrives=True)
+                if page:args['pageToken']=page
+                result=service.files().list(**args).execute()
+                found.extend(result.get('files',[]));page=result.get('nextPageToken')
+                if not page:break
+            return found
+
+        def move_item(item_id,src,dst):
+            service.files().update(fileId=item_id,addParents=dst,removeParents=src,fields='id,parents',supportsAllDrives=True).execute()
+
+        # A staging folder prevents incomplete uploads from replacing a usable appraisal.
+        # Retrying an export reuses this staging folder and never creates a new version.
+        stage=drive_child(service,parent,'_Export In Progress')
+        drive_upload(service,stage,f'{record_id} - Appraisal Only.pdf',clean_bytes,'application/pdf')
+        drive_upload(service,stage,f'{record_id} - Complete Appraisal.pdf',combined_bytes,'application/pdf')
+        photos_folder=drive_child(service,stage,'Equipment Photos')
         internal_folder=None
         support_folder=None
         for category in ('photos','internal_photos','supporting_documents'):
             for i,f in enumerate(request.files.getlist(category),1):
-                # Safe, stable names; never use untrusted path fragments.
                 extension=os.path.splitext(f.filename or '')[1].lower()
                 if extension not in ('.jpg','.jpeg','.png','.webp','.heic','.pdf'):
                     extension='.pdf' if f.mimetype=='application/pdf' else '.jpg'
                 if category=='photos':dest=photos_folder
                 elif category=='internal_photos':
-                    if internal_folder is None:internal_folder=drive_child(service,rev_folder,'Internal Photos - Restricted')
+                    if internal_folder is None:internal_folder=drive_child(service,stage,'Internal Photos & Documents')
                     dest=internal_folder
                 else:
-                    if support_folder is None:support_folder=drive_child(service,rev_folder,'Supporting Documents - Restricted')
+                    if support_folder is None:support_folder=drive_child(service,stage,'Internal Photos & Documents')
                     dest=support_folder
-                # Same bytes were validated above; file pointers reset after read.
                 f.stream.seek(0)
                 drive_upload(service,dest,f'{category}-{i:02d}{extension}',f.read(),f.mimetype or 'application/octet-stream')
+
+        export_info=r.get('driveExport') or {}
+        previous_revision=int(export_info.get('revision',0) or 0)
+        # Archive only when a NEW revision is being exported; a retry is not a resubmission.
+        previous_items=[item for item in list_children(parent) if item['name'] not in ('_Export In Progress','Archived Versions')]
+        if previous_items and revision>previous_revision:
+            archive=drive_child(service,parent,'Archived Versions')
+            old_version=drive_child(service,archive,'Version '+str(previous_revision or max(1,revision-1)))
+            for item in previous_items:move_item(item['id'],parent,old_version)
+        elif previous_items and revision==previous_revision:
+            # Retry: replace the files for this same version, without creating history.
+            # Preserve an existing file until the new staging upload has completed.
+            for item in previous_items:
+                service.files().delete(fileId=item['id'],supportsAllDrives=True).execute()
+        elif previous_items:
+            return fail('A newer export already exists. Reopen the appraisal before exporting.',409)
+        for item in list_children(stage):move_item(item['id'],stage,parent)
+        service.files().delete(fileId=stage,supportsAllDrives=True).execute()
         link='https://drive.google.com/drive/folders/'+parent
-        collection('records').document(record_id).update({'driveExport':{'revision':revision,'folderId':parent,'revisionFolderId':rev_folder,'url':link,'exportedAt':datetime.datetime.now(datetime.timezone.utc).isoformat(),'exportedBy':u['email']}})
+        collection('records').document(record_id).update({'driveExport':{'revision':revision,'folderId':parent,'url':link,'exportedAt':datetime.datetime.now(datetime.timezone.utc).isoformat(),'exportedBy':u['email']}})
         return jsonify(ok=True,folderUrl=link,revision=revision)
     except Exception:
         app.logger.exception('Google Drive export failed for %s',record_id)
