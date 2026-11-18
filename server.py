@@ -317,6 +317,42 @@ def export_submitted(record_id):
 
 
 # Help-only AI pilot. Authentication is required; no appraisal record data is sent.
+@app.post('/api/support/tickets')
+def submit_support_ticket():
+    """Append to existing IT ticket sheet; requires Sheets API and service-account sheet access."""
+    try:
+        u=user()
+    except PermissionError as exc:
+        return fail(str(exc),401)
+    payload=request.get_json(silent=True) or {}
+    title=str(payload.get('title','')).strip()
+    details=str(payload.get('details','')).strip()
+    if not title or not details or len(title)>150 or len(details)>3000:
+        return fail('Issue title and details are required (150 / 3000 character limits).')
+    spreadsheet_id=os.environ.get('IT_TICKET_SPREADSHEET_ID','').strip()
+    sheet_tab=os.environ.get('IT_TICKET_SHEET_TAB','').strip()
+    if not spreadsheet_id or not sheet_tab:
+        return fail('Ticket submission is not configured yet. Please contact IT.',503)
+    # Columns B:J: timestamp, name, email, title, details, email address,
+    # assignment, status, solution. No user-controlled formula execution.
+    def safe_cell(value):
+        value=str(value)
+        return "'"+value if value.startswith(('=','+','-','@')) else value
+    now=datetime.datetime.now(datetime.timezone.utc).isoformat()
+    row=[now,safe_cell(u.get('name',u['email'])),u['email'],safe_cell(title),safe_cell(details),u['email'],'','New','']
+    try:
+        import google.auth
+        credentials,_=google.auth.default(scopes=['https://www.googleapis.com/auth/spreadsheets'])
+        sheets=build('sheets','v4',credentials=credentials,cache_discovery=False)
+        escaped=sheet_tab.replace("'","''")
+        result=sheets.spreadsheets().values().append(spreadsheetId=spreadsheet_id,
+            range=f"'{escaped}'!B:J",valueInputOption='RAW',insertDataOption='INSERT_ROWS',
+            body={'values':[row]}).execute()
+        return jsonify(ok=True,updatedRange=result.get('updates',{}).get('updatedRange',''))
+    except Exception:
+        app.logger.exception('IT ticket append failed')
+        return fail('Could not save ticket to the IT sheet. Please contact IT directly.',502)
+
 @app.post('/api/support/ask')
 def support_ask():
     try:
