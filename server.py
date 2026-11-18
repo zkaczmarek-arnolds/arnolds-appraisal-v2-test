@@ -74,17 +74,13 @@ def create():
     body=request.get_json(silent=True) or {}
     if body.get('mode') not in ('draft','blank'):return fail('Invalid mode')
     if not isinstance(body.get('form'),int) or body['form']<0:return fail('Invalid form')
-    @firestore.transactional
-    def reserve(tx):
-        ref=collection('counters').document('appraisals')
-        snap=ref.get(transaction=tx)
-        seq=(snap.to_dict() or {}).get('seq',0)+1 if snap.exists else 1
-        tx.set(ref,{'seq':seq})
-        return seq
-    seq=reserve(client.transaction())
-    now=datetime.datetime.now(datetime.timezone.utc).isoformat()
-    id=f'{datetime.datetime.now().year%100:02d}-{seq:05d}'
-    status='Blank Printed' if body['mode']=='blank' else 'Draft'
+    # Client-generated key identifies one logical creation, even across retries.
+    request_id=str(body.get('requestId','')).strip()
+    if not re.fullmatch(r'[a-zA-Z0-9_-]{12,100}',request_id):
+        return fail('Missing or invalid request ID')
+    # Bind request keys to the authenticated employee; avoid cross-user collisions.
+    import hashlib
+    key=hashlib.sha256((u['email']+'|'+request_id).encode()).hexdigest()
     locations=u.get('locations',[])
     store=u.get('homeStore','')
     if store not in STORES or (u['role']!='System Admin' and store not in locations):
@@ -92,9 +88,35 @@ def create():
     if not store:
         return fail('Set a valid home store in the employee profile before creating an appraisal')
     initials=str(u.get('dmsInitials','')).strip()[:20]
-    r={'id':id,'status':status,'form':body['form'],'formName':str(body.get('formName',''))[:250], 'version':1,'salesEmail':u['email'],'salesName':u.get('name',u['email']),'initials':initials,'store':store,'created':now,'updated':now,'serial':'','make':'','model':'','customer':'','stock':'','data':{'salesinitials':initials,'location':store},'revisions':0,'audit':[{'at':now,'by':u['email'],'action':'BLANK_PRINTED' if body['mode']=='blank' else 'CREATED'}]}
-    collection('records').document(id).create(r)
-    return jsonify(record=r),201
+    @firestore.transactional
+    def create_once(tx):
+        idem_ref=collection('creation_requests').document(key)
+        previous=idem_ref.get(transaction=tx)
+        if previous.exists:
+            meta=previous.to_dict()
+            if meta.get('mode')!=body['mode'] or meta.get('form')!=body['form']:
+                raise ValueError('Request ID was reused for a different appraisal')
+            existing_ref=collection('records').document(meta['recordId'])
+            existing=existing_ref.get(transaction=tx)
+            if not existing.exists:
+                raise ValueError('Previously created appraisal is unavailable')
+            return existing.to_dict(),False
+        counter=collection('counters').document('appraisals')
+        snap=counter.get(transaction=tx)
+        seq=((snap.to_dict() or {}).get('seq',0)+1) if snap.exists else 1
+        now=datetime.datetime.now(datetime.timezone.utc).isoformat()
+        record_id=f'{datetime.datetime.now().year%100:02d}-{seq:05d}'
+        status='Blank Printed' if body['mode']=='blank' else 'Draft'
+        r={'id':record_id,'status':status,'form':body['form'],'formName':str(body.get('formName',''))[:250], 'version':1,'salesEmail':u['email'],'salesName':u.get('name',u['email']),'initials':initials,'store':store,'created':now,'updated':now,'serial':'','make':'','model':'','customer':'','stock':'','data':{'salesinitials':initials,'location':store},'revisions':0,'audit':[{'at':now,'by':u['email'],'action':'BLANK_PRINTED' if body['mode']=='blank' else 'CREATED'}]}
+        tx.set(counter,{'seq':seq})
+        tx.create(collection('records').document(record_id),r)
+        tx.create(idem_ref,{'recordId':record_id,'mode':body['mode'],'form':body['form'],'created':now,'email':u['email']})
+        return r,True
+    try:
+        record,created=create_once(client.transaction())
+    except ValueError as e:
+        return fail(str(e))
+    return jsonify(record=record,created=created),(201 if created else 200)
 
 @app.put('/api/records/<record_id>')
 def update(record_id):
@@ -291,6 +313,49 @@ def export_submitted(record_id):
     except Exception:
         app.logger.exception('Google Drive export failed for %s',record_id)
         return fail('Google Drive export failed. Appraisal remains submitted in Firestore. Retry export from the appraisal page.',502)
+
+
+
+# Help-only AI pilot. Authentication is required; no appraisal record data is sent.
+@app.post('/api/support/ask')
+def support_ask():
+    try:
+        u=identity()
+    except Exception:
+        return fail('Sign in to use the support assistant.',401)
+    payload=request.get_json(silent=True) or {}
+    question=str(payload.get('question','')).strip()
+    if not question or len(question)>1000:
+        return fail('Enter a question up to 1000 characters.')
+    api_key=os.environ.get('OPENAI_API_KEY','')
+    if not api_key:
+        return jsonify(answer='The AI assistant has not been configured yet. Please use the How-To tab or Report Issue to contact IT.',configured=False)
+    import requests
+    knowledge=(
+        'You are a read-only help assistant for Arnold Companies Equipment Appraisal TEST system. '
+        'Answer only how-to questions about the appraisal workflow. Never request passwords or sensitive customer information. '
+        'If unsure, say so and direct the user to Report Issue. Never claim to have accessed a live appraisal or changed records. '
+        'Known workflow: Save Draft saves to Firestore without Drive export; Submit creates a submitted revision; '
+        'Google Drive export organizes files by store, salesperson, appraisal folder; latest exports in main folder, '
+        'older submitted versions in Archived Versions. Google Drive export may fail separately from successful submission. '
+        'Manager approval is not confirmed as implemented. Do not claim that it is.'
+    )
+    try:
+        response=requests.post('https://api.openai.com/v1/responses',headers={'Authorization':'Bearer '+api_key,'Content-Type':'application/json'},json={
+            'model':os.environ.get('OPENAI_SUPPORT_MODEL','gpt-4.1-mini'),
+            'instructions':knowledge,
+            'input':question,
+            'max_output_tokens':350,
+            'store':False
+        },timeout=25)
+        response.raise_for_status()
+        data=response.json()
+        parts=[c.get('text','') for item in data.get('output',[]) for c in item.get('content',[]) if c.get('type')=='output_text']
+        answer='\n'.join(parts).strip()
+        return jsonify(answer=answer or 'I could not generate an answer. Please report the issue to IT.',configured=True)
+    except Exception:
+        app.logger.exception('Support AI request failed')
+        return fail('AI support is temporarily unavailable. Please use Report Issue.',502)
 
 @app.get('/api/health')
 def health():return jsonify(status='ok',environment='TEST')
