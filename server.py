@@ -309,7 +309,12 @@ def export_submitted(record_id):
         service.files().delete(fileId=stage,supportsAllDrives=True).execute()
         link='https://drive.google.com/drive/folders/'+parent
         collection('records').document(record_id).update({'driveExport':{'revision':revision,'folderId':parent,'url':link,'exportedAt':datetime.datetime.now(datetime.timezone.utc).isoformat(),'exportedBy':u['email']}})
-        return jsonify(ok=True,folderUrl=link,revision=revision)
+        try:
+            notification=notify_export(r,revision,link,combined_bytes)
+        except Exception:
+            app.logger.exception('Notification processing failed')
+            notification={'status':'uncertain','message':'Check notification history before retrying'}
+        return jsonify(ok=True,folderUrl=link,revision=revision,notification=notification)
     except Exception:
         app.logger.exception('Google Drive export failed for %s',record_id)
         return fail('Google Drive export failed. Appraisal remains submitted in Firestore. Retry export from the appraisal page.',502)
@@ -393,7 +398,73 @@ def support_ask():
         app.logger.exception('Support AI request failed')
         return fail('AI support is temporarily unavailable. Please use Report Issue.',502)
 
+
+# TEST notification settings and per-revision send ledger.
+@app.route('/api/notification-settings', methods=['GET','PUT'])
+def notification_settings():
+    u=user()
+    if u['role']!='System Admin':raise PermissionError('System Admin required')
+    ref=collection('settings').document('notifications')
+    if request.method=='GET':return jsonify(stores=(ref.get().to_dict() or {}).get('stores',{}),testEmail=os.getenv('APPRAISAL_TEST_EMAIL',''))
+    body=request.get_json(silent=True) or {}; stores=body.get('stores')
+    if not isinstance(stores,dict) or set(stores)!=set(STORES):return fail('Invalid stores')
+    for store, groups in stores.items():
+        if not isinstance(groups,dict) or set(groups)!={'admin','manager'}:return fail('Invalid recipient groups')
+        for addresses in groups.values():
+            if not isinstance(addresses,list) or len(addresses)>20 or any(not isinstance(a,str) or not re.fullmatch(r'[a-zA-Z0-9._%+-]+@'+re.escape(ALLOWED_DOMAIN),a) for a in addresses):return fail('Use company email addresses only')
+    ref.set({'stores':stores,'updatedBy':u['email']})
+    return jsonify(ok=True)
+
+def notify_export(r,revision,link,pdf):
+    import base64, requests
+    # Fail closed: this TEST build never sends to configured store recipients.
+    recipient=os.getenv('APPRAISAL_TEST_EMAIL','').strip()
+    sender=os.getenv('SENDGRID_FROM_EMAIL','').strip(); key=os.getenv('SENDGRID_API_KEY','')
+    ref=collection('notification_history').document(r['id']+'_'+str(revision))
+    @firestore.transactional
+    def claim(tx):
+        old=ref.get(transaction=tx).to_dict() or {}
+        if old.get('status') in ('accepted','sending','uncertain'):return old,False
+        info={'status':'sending','revision':revision,'recipient':recipient,'at':datetime.datetime.now(datetime.timezone.utc).isoformat()}
+        tx.set(ref,info);return info,True
+    info,claimed=claim(client.transaction())
+    if not claimed:return info
+    def finish(status,message):
+        info.update(status=status,message=message);ref.set(info);return info
+    if not recipient or not sender or not key:return finish('failed','Email configuration missing')
+    if not re.fullmatch(r'[a-zA-Z0-9._%+-]+@'+re.escape(ALLOWED_DOMAIN),recipient):return finish('failed','Invalid TEST recipient')
+    if len(pdf)>20*1024*1024:return finish('failed','PDF exceeds email attachment limit')
+    equipment=' '.join(str(r.get(k) or '') for k in ('make','model')).strip()
+    title='Revised Appraisal Submitted' if revision>1 else 'New Appraisal Submitted'
+    subject='[TEST] '+title+' | #'+r['id']+' | '+equipment
+    text=title+'.\n\n'+'\n'.join(label+': '+str(value or '—') for label,value in [('Appraisal Number',r['id']),('Location',r.get('store')),('Salesperson',r.get('salesName')),('Customer',r.get('customer')),('Equipment',equipment),('Submitted (UTC)',r.get('updated'))])+'\n\nThe completed appraisal is attached for your review.\nView Appraisal in Google Drive: '+link+'\n\nThis is an automated TEST notification from Arnold’s Appraisal System.'
+    payload={'personalizations':[{'to':[{'email':recipient}]}],'from':{'email':sender,'name':os.getenv('SENDGRID_FROM_NAME',"Arnold's Appraisals")},'subject':subject,'content':[{'type':'text/plain','value':text}],'attachments':[{'content':base64.b64encode(pdf).decode(),'type':'application/pdf','filename':r['id']+' - Complete Appraisal.pdf','disposition':'attachment'}]}
+    try:
+        response=requests.post('https://api.sendgrid.com/v3/mail/send',headers={'Authorization':'Bearer '+key},json=payload,timeout=25)
+    except requests.RequestException:return finish('uncertain','Send outcome unknown; check SendGrid activity before retrying')
+    if response.status_code==202:return finish('accepted','Accepted by SendGrid; delivery not confirmed')
+    if response.status_code>=500:return finish('uncertain','SendGrid server error; check activity before retrying')
+    return finish('failed','SendGrid rejected request (HTTP '+str(response.status_code)+')')
+
+@app.get('/api/records/<record_id>/notification')
+def notification_status(record_id):
+    u=user();r=collection('records').document(record_id).get().to_dict()
+    if not r or not visible(u,r):return fail('Appraisal not available',404)
+    return jsonify(notification=collection('notification_history').document(record_id+'_'+str(r.get('revisions',0))).get().to_dict() or {})
+
+@app.post('/api/records/<record_id>/notification/retry')
+def retry_notification(record_id):
+    u=user();r=collection('records').document(record_id).get().to_dict()
+    if not r or not editable(u,r):return fail('Appraisal not available',403)
+    rev=int(r.get('revisions',0));export=r.get('driveExport') or {}
+    if r.get('status')!='Submitted' or export.get('revision')!=rev:return fail('Complete Drive export first',409)
+    service=drive_service();folder=export['folderId'];name=record_id+' - Complete Appraisal.pdf'
+    files=service.files().list(q=f"'{folder}' in parents and name = '{name}' and trashed = false",fields='files(id)',supportsAllDrives=True,includeItemsFromAllDrives=True).execute().get('files',[])
+    if len(files)!=1:return fail('Exported PDF not uniquely available',409)
+    pdf=service.files().get_media(fileId=files[0]['id'],supportsAllDrives=True).execute()
+    return jsonify(notification=notify_export(r,rev,export['url'],pdf))
+
 @app.get('/api/health')
-def health():return jsonify(status='ok',environment='TEST',version='02.6')
+def health():return jsonify(status='ok',environment='TEST',version='02.7')
 
 if __name__=='__main__':app.run(host='0.0.0.0',port=int(os.getenv('PORT','8080')))
