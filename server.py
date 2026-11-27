@@ -132,7 +132,7 @@ def update(record_id):
         if not visible(u,old) or not editable(u,old):raise PermissionError('Not allowed to edit this appraisal')
         if old['status']=='Finalized' and u['role']!='System Admin':raise PermissionError('Finalized appraisals are locked')
         newstatus=body.get('status',old['status'])
-        transitions={'Draft':{'Draft','Submitted','Unused'},'Blank Printed':{'Blank Printed','Draft','Unused'},'Submitted':{'Submitted','Finalized','Draft'},'Finalized':{'Finalized','Submitted'},'Unused':{'Unused'},'Void':{'Void'}}
+        transitions={'Draft':{'Draft','Submitted','Unused'},'Blank Printed':{'Blank Printed','Draft','Submitted','Unused'},'Submitted':{'Submitted','Finalized','Draft'},'Finalized':{'Finalized','Submitted'},'Unused':{'Unused'},'Void':{'Void'}}
         if newstatus not in transitions.get(old['status'],set()):raise ValueError('Invalid status transition')
         if newstatus=='Finalized' and u['role'] not in ('Store Admin','System Admin'):raise PermissionError('Manager or admin finalization required')
         if newstatus=='Submitted' and not str(body.get('serial',old.get('serial',''))).strip():raise ValueError('Serial number required')
@@ -394,6 +394,6 @@ def support_ask():
         return fail('AI support is temporarily unavailable. Please use Report Issue.',502)
 
 @app.get('/api/health')
-def health():return jsonify(status='ok',environment='TEST')
+def health():return jsonify(status='ok',environment='TEST',version='02.5')
 
 if __name__=='__main__':app.run(host='0.0.0.0',port=int(os.getenv('PORT','8080')))
