@@ -394,6 +394,6 @@ def support_ask():
         return fail('AI support is temporarily unavailable. Please use Report Issue.',502)
 
 @app.get('/api/health')
-def health():return jsonify(status='ok',environment='TEST',version='02.5')
+def health():return jsonify(status='ok',environment='TEST',version='02.6')
 
 if __name__=='__main__':app.run(host='0.0.0.0',port=int(os.getenv('PORT','8080')))
