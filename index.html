@@ -199,9 +199,14 @@ function markUnused(id){let d=db(),r=d.records.find(x=>x.id===id);if(!r||r.statu
 let creationBusy=false;let creationRequestId=null;
 function newChooser(mode){
  if(creationBusy)return;
+ if(mode!=='draft'&&mode!=='blank')return;
  creationRequestId=(typeof crypto!=='undefined'&&crypto.randomUUID)?crypto.randomUUID():('req_'+Date.now()+'_'+Math.random().toString(36).slice(2));
+ const isBlank=mode==='blank';
+ const title=isBlank?'Print Blank Appraisal':'Start New Appraisal';
+ const action=isBlank?'🖨 Generate Blank Appraisal':'＋ Create Appraisal';
+ const description=isBlank?'Choose an equipment form to generate a numbered blank appraisal for handwriting. It will appear in My Appraisals for later entry.':'Choose an equipment form to start completing your appraisal electronically.';
  let cats=[...new Set(FORMS.map(f=>String(f.category||'').trim()).filter(Boolean))].sort();
- showModal(`<h2>New Equipment Appraisal</h2><p class="muted">Select an equipment type, then choose how to complete the appraisal. Both options reserve a unique number and save the appraisal in your list.</p><div class="field"><label>Category</label><select id="cat" onchange="fillForms()"><option value="">All categories</option>${cats.map(c=>`<option>${esc(c)}</option>`).join('')}</select></div><div class="field" style="margin-top:12px"><label>Appraisal Form</label><select id="fsel"></select></div><div class="actions" style="margin-top:18px;display:grid;grid-template-columns:1fr;gap:10px"><button class="btn red" data-create-action="draft" onclick="createRecord('draft')">＋ Create New Appraisal</button><div class="muted tiny">Complete the appraisal electronically.</div><button class="btn dark" data-create-action="blank" onclick="createRecord('blank')">🖨 Print Blank Appraisal</button><div class="muted tiny">Print a numbered, otherwise blank form for handwriting. It stays in My Appraisals for later entry.</div><button class="btn light" onclick="hideModal()">Cancel</button></div>`);
+ showModal(`<h2>${title}</h2><p class="muted">${description}</p><div class="field"><label>Category</label><select id="cat" onchange="fillForms()"><option value="">All categories</option>${cats.map(c=>`<option>${esc(c)}</option>`).join('')}</select></div><div class="field" style="margin-top:12px"><label>Appraisal Form</label><select id="fsel"></select></div><div class="actions" style="margin-top:18px;display:grid;grid-template-columns:1fr;gap:10px"><button class="btn ${isBlank?'dark':'red'}" data-create-action="${mode}" onclick="createRecord('${mode}')">${action}</button><button class="btn light" onclick="hideModal()">Cancel</button></div>`);
  fillForms();
 }
 
@@ -737,7 +742,7 @@ if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded'
 <div class="arn-tabs"><button type="button" data-arn-tab="guides" class="active">How-To</button><button type="button" data-arn-tab="ticket">Report Issue</button></div>
 <div class="arn-body" id="arn-tab-guides">
 <p class="arn-note">Help for the appraisal workflow. Instructions are based on the TEST system; ask IT if a screen differs.</p>
-<details><summary>Print a numbered blank appraisal</summary><p>From New Appraisal, choose the equipment form and select Print Blank Appraisal. The system reserves an appraisal number, adds it to My Appraisals as Blank Printed, and opens the PDF. Print it and enter the handwritten information later using the same number.</p></details>
+<details><summary>Print a numbered blank appraisal</summary><p>From the home screen, select Print Blank Appraisal and choose the equipment form. The system reserves an appraisal number, adds it to My Appraisals as Blank Printed, and opens the PDF. Print it and enter the handwritten information later using the same number.</p></details>
 <details open><summary>Save an appraisal draft</summary><p>Complete the available fields and select Save Draft. This saves the work without submitting or exporting files to Drive.</p></details>
 <details><summary>Submit an appraisal</summary><p>Complete the required equipment information and photos, then select Submit. Wait for the submission confirmation. The Google Drive export may run separately; if it fails, report the error to IT.</p></details>
 <details><summary>Where are completed appraisals stored?</summary><p>Exports are organized in the appraisal TEST Shared Drive by store, salesperson, and appraisal number/equipment. Latest files appear in the appraisal folder.</p></details>
