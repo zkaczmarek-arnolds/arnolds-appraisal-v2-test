@@ -44,6 +44,8 @@ def user():
     # Existing bootstrap users also receive these defaults; other employees
     # use their configured Firestore user profile values.
     if email==BOOTSTRAP_ADMIN:
+        if email == 'zkaczmarek@arnoldsinc.com' and u.get('name') in (None, '', 'zkaczmarek'):
+            u['name']='Zach Kaczmarek'
         u.setdefault('homeStore','Glencoe')
         u.setdefault('dmsInitials','ZK1')
     return u
