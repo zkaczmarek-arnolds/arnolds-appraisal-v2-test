@@ -6,6 +6,7 @@ from google.oauth2 import id_token
 from google.oauth2.credentials import Credentials as OAuthCredentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
+from googleapiclient.errors import HttpError
 
 app=Flask(__name__,static_folder=None)
 client=firestore.Client()
@@ -362,7 +363,7 @@ def submit_support_ticket():
     @firestore.transactional
     def claim(tx):
         old=ref.get(transaction=tx).to_dict()
-        if old:return old,False
+        if old and old.get('status')!='rejected':return old,False
         info={'status':'writing','email':u['email'],'at':datetime.datetime.now(datetime.timezone.utc).isoformat()}
         tx.set(ref,info);return info,True
     info,claimed=claim(client.transaction())
@@ -370,7 +371,7 @@ def submit_support_ticket():
         if info.get('status')=='saved':return jsonify(ok=True,emailStatus=info.get('emailStatus','unknown'),duplicate=True)
         return fail('Ticket outcome pending or unknown. Contact IT before submitting again.',409)
     title='[TEST] '+title
-    details += '\n\nSource: Appraisals TEST 02.8\nStore: '+str(u.get('homeStore') or ', '.join(u.get('locations',[])))+'\nTicket reference: '+request_id
+    details += '\n\nSource: Appraisals TEST 02.9.2\nStore: '+str(u.get('homeStore') or ', '.join(u.get('locations',[])))+'\nTicket reference: '+request_id
     now=datetime.datetime.now(datetime.timezone.utc).isoformat()
     row=[now,u.get('name',u['email']),u['email'],title,details,u['email'],'','New','']
     try:
@@ -381,6 +382,13 @@ def submit_support_ticket():
         result=sheets.spreadsheets().values().append(spreadsheetId=spreadsheet_id,
             range=f"'{escaped}'!B:J",valueInputOption='RAW',insertDataOption='INSERT_ROWS',
             body={'values':[row]}).execute(num_retries=0)
+    except HttpError as exc:
+        code=int(exc.resp.status)
+        app.logger.exception('IT ticket append failed (HTTP %s)',code)
+        if code in (400,401,403,404,429):
+            ref.set(dict(info,status='rejected',errorCode=code))
+            return jsonify(error='Google Sheets rejected the ticket (HTTP '+str(code)+'). Contact IT to correct the issue, then retry this ticket.',retryable=True),502
+        return fail('Ticket save outcome unknown. Contact IT before submitting again.',502)
     except Exception:
         app.logger.exception('IT ticket append failed')
         return fail('Ticket save outcome unknown. Contact IT before submitting again.',502)
@@ -445,14 +453,16 @@ def notification_settings():
     u=user()
     if u['role']!='System Admin':raise PermissionError('System Admin required')
     ref=collection('settings').document('notifications')
-    if request.method=='GET':return jsonify(stores=(ref.get().to_dict() or {}).get('stores',{}),testEmail=os.getenv('APPRAISAL_TEST_EMAIL',''))
+    if request.method=='GET':return jsonify(stores=(ref.get().to_dict() or {}).get('stores',{}),testEmail=os.getenv('APPRAISAL_TEST_EMAIL',''),itRecipients=(ref.get().to_dict() or {}).get('itRecipients',['itadmin@arnoldsinc.com']))
     body=request.get_json(silent=True) or {}; stores=body.get('stores')
     if not isinstance(stores,dict) or set(stores)!=set(STORES):return fail('Invalid stores')
     for store, groups in stores.items():
         if not isinstance(groups,dict) or set(groups)!={'admin','manager'}:return fail('Invalid recipient groups')
         for addresses in groups.values():
             if not isinstance(addresses,list) or len(addresses)>20 or any(not isinstance(a,str) or not re.fullmatch(r'[a-zA-Z0-9._%+-]+@'+re.escape(ALLOWED_DOMAIN),a) for a in addresses):return fail('Use company email addresses only')
-    ref.set({'stores':stores,'updatedBy':u['email']})
+    it=body.get('itRecipients')
+    if not isinstance(it,list) or not 1<=len(it)<=20 or any(not isinstance(a,str) or not re.fullmatch(r'[a-zA-Z0-9._%+-]+@'+re.escape(ALLOWED_DOMAIN),a) for a in it):return fail('Enter at least one valid company IT email address')
+    ref.set({'stores':stores,'itRecipients':list(dict.fromkeys(it)),'updatedBy':u['email']},merge=True)
     return jsonify(ok=True)
 
 def notify_export(r,revision,link,pdf):
@@ -505,6 +515,6 @@ def retry_notification(record_id):
     return jsonify(notification=notify_export(r,rev,export['url'],pdf))
 
 @app.get('/api/health')
-def health():return jsonify(status='ok',environment='TEST',version='02.9.1')
+def health():return jsonify(status='ok',environment='TEST',version='02.9.2')
 
 if __name__=='__main__':app.run(host='0.0.0.0',port=int(os.getenv('PORT','8080')))
