@@ -338,13 +338,25 @@ def submit_support_ticket():
     sheet_tab=os.environ.get('IT_TICKET_SHEET_TAB','').strip()
     if not spreadsheet_id or not sheet_tab:
         return fail('Ticket submission is not configured yet. Please contact IT.',503)
-    # Columns B:J: timestamp, name, email, title, details, email address,
-    # assignment, status, solution. No user-controlled formula execution.
-    def safe_cell(value):
-        value=str(value)
-        return "'"+value if value.startswith(('=','+','-','@')) else value
+    request_id=str(payload.get('requestId',''))
+    if not re.fullmatch(r'[a-zA-Z0-9_-]{12,100}',request_id):return fail('Invalid ticket request ID')
+    recipient=os.getenv('APPRAISAL_TEST_EMAIL','').strip()
+    if not re.fullmatch(r'[a-zA-Z0-9._%+-]+@'+re.escape(ALLOWED_DOMAIN),recipient):return fail('TEST recipient not configured',503)
+    ref=collection('support_ticket_requests').document(hashlib.sha256((u['email']+'|'+request_id).encode()).hexdigest())
+    @firestore.transactional
+    def claim(tx):
+        old=ref.get(transaction=tx).to_dict()
+        if old:return old,False
+        info={'status':'writing','email':u['email'],'at':datetime.datetime.now(datetime.timezone.utc).isoformat()}
+        tx.set(ref,info);return info,True
+    info,claimed=claim(client.transaction())
+    if not claimed:
+        if info.get('status')=='saved':return jsonify(ok=True,emailStatus=info.get('emailStatus','unknown'),duplicate=True)
+        return fail('Ticket outcome pending or unknown. Contact IT before submitting again.',409)
+    title='[TEST] '+title
+    details += '\n\nSource: Appraisals TEST 02.8\nStore: '+str(u.get('homeStore') or ', '.join(u.get('locations',[])))+'\nTicket reference: '+request_id
     now=datetime.datetime.now(datetime.timezone.utc).isoformat()
-    row=[now,safe_cell(u.get('name',u['email'])),u['email'],safe_cell(title),safe_cell(details),u['email'],'','New','']
+    row=[now,u.get('name',u['email']),u['email'],title,details,u['email'],'','New','']
     try:
         import google.auth
         credentials,_=google.auth.default(scopes=['https://www.googleapis.com/auth/spreadsheets'])
@@ -352,11 +364,23 @@ def submit_support_ticket():
         escaped=sheet_tab.replace("'","''")
         result=sheets.spreadsheets().values().append(spreadsheetId=spreadsheet_id,
             range=f"'{escaped}'!B:J",valueInputOption='RAW',insertDataOption='INSERT_ROWS',
-            body={'values':[row]}).execute()
-        return jsonify(ok=True,updatedRange=result.get('updates',{}).get('updatedRange',''))
+            body={'values':[row]}).execute(num_retries=0)
     except Exception:
         app.logger.exception('IT ticket append failed')
-        return fail('Could not save ticket to the IT sheet. Please contact IT directly.',502)
+        return fail('Ticket save outcome unknown. Contact IT before submitting again.',502)
+    info.update(status='saved',emailStatus='pending',updatedRange=result.get('updates',{}).get('updatedRange',''))
+    ref.set(info)
+    try:
+        import requests
+        sender=os.getenv('SENDGRID_FROM_EMAIL','').strip(); key=os.getenv('SENDGRID_API_KEY','')
+        if not sender or not key:raise ValueError('Missing email configuration')
+        mail={'personalizations':[{'to':[{'email':recipient}]}],'from':{'email':sender,'name':os.getenv('SENDGRID_FROM_NAME',"Arnold's Appraisals")},'subject':title.replace('\r',' ').replace('\n',' '),'content':[{'type':'text/plain','value':'New IT support ticket (TEST)\n\nEmployee: '+str(u.get('name',u['email']))+'\nEmail: '+u['email']+'\nIssue: '+title+'\n\n'+details}]}
+        response=requests.post('https://api.sendgrid.com/v3/mail/send',headers={'Authorization':'Bearer '+key},json=mail,timeout=25)
+        info['emailStatus']='accepted' if response.status_code==202 else ('unknown' if response.status_code>=500 else 'failed')
+    except Exception:
+        app.logger.exception('IT ticket email failed');info['emailStatus']='unknown'
+    ref.set(info)
+    return jsonify(ok=True,emailStatus=info['emailStatus'],updatedRange=info['updatedRange'])
 
 @app.post('/api/support/ask')
 def support_ask():
@@ -465,6 +489,6 @@ def retry_notification(record_id):
     return jsonify(notification=notify_export(r,rev,export['url'],pdf))
 
 @app.get('/api/health')
-def health():return jsonify(status='ok',environment='TEST',version='02.7')
+def health():return jsonify(status='ok',environment='TEST',version='02.8')
 
 if __name__=='__main__':app.run(host='0.0.0.0',port=int(os.getenv('PORT','8080')))
