@@ -373,7 +373,7 @@ def submit_support_ticket():
         if info.get('status')=='saved':return jsonify(ok=True,emailStatus=info.get('emailStatus','unknown'),duplicate=True)
         return fail('Ticket outcome pending or unknown. Contact IT before submitting again.',409)
     title='[TEST] '+title
-    details += '\n\nSource: Appraisals TEST 02.9.2a\nStore: '+str(u.get('homeStore') or ', '.join(u.get('locations',[])))+'\nTicket reference: '+request_id
+    details += '\n\nSource: Appraisals TEST 02.9.3\nStore: '+str(u.get('homeStore') or ', '.join(u.get('locations',[])))+'\nTicket reference: '+request_id
     now=datetime.datetime.now(datetime.timezone.utc).isoformat()
     row=[now,u.get('name',u['email']),u['email'],title,details,u['email'],'','New','']
     try:
@@ -517,6 +517,6 @@ def retry_notification(record_id):
     return jsonify(notification=notify_export(r,rev,export['url'],pdf))
 
 @app.get('/api/health')
-def health():return jsonify(status='ok',environment='TEST',version='02.9.2a')
+def health():return jsonify(status='ok',environment='TEST',version='02.9.3')
 
 if __name__=='__main__':app.run(host='0.0.0.0',port=int(os.getenv('PORT','8080')))
