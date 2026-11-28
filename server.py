@@ -33,6 +33,7 @@ def user():
     doc=collection('users').document(email).get()
     if doc.exists:
         u=doc.to_dict()
+        if u.get('role') not in ROLES: raise PermissionError('Invalid account role')
         if not u.get('active',False): raise PermissionError('Account disabled')
     elif email==BOOTSTRAP_ADMIN:
         u={'email':email,'name':email.split('@')[0],'role':'System Admin','locations':STORES,'active':True}
@@ -132,13 +133,28 @@ def update(record_id):
         if not visible(u,old) or not editable(u,old):raise PermissionError('Not allowed to edit this appraisal')
         if old['status']=='Finalized' and u['role']!='System Admin':raise PermissionError('Finalized appraisals are locked')
         newstatus=body.get('status',old['status'])
-        transitions={'Draft':{'Draft','Submitted','Unused'},'Blank Printed':{'Blank Printed','Draft','Submitted','Unused'},'Submitted':{'Submitted','Finalized','Draft'},'Finalized':{'Finalized','Submitted'},'Unused':{'Unused'},'Void':{'Void'}}
+        transitions={'Draft':{'Draft','Submitted','Unused'},'Blank Printed':{'Blank Printed','Draft','Submitted','Unused'},'Submitted':{'Submitted','Finalized'},'Finalized':{'Finalized'},'Unused':{'Unused'},'Void':{'Void'}}
         if newstatus not in transitions.get(old['status'],set()):raise ValueError('Invalid status transition')
         if newstatus=='Finalized' and u['role'] not in ('Store Admin','System Admin'):raise PermissionError('Manager or admin finalization required')
         if newstatus=='Submitted' and not str(body.get('serial',old.get('serial',''))).strip():raise ValueError('Serial number required')
         if newstatus=='Finalized' and not str(body.get('customer',old.get('customer',''))).strip():raise ValueError('Customer required')
         allowed=('status','serial','make','model','customer','stock','data','initials','store','revisions')
         updates={k:body[k] for k in allowed if k in body}
+        previous_revision=int(old.get('revisions',0))
+        requested_revision=updates.get('revisions',previous_revision)
+        if type(requested_revision) is not int:raise ValueError('Invalid revision number')
+        if old['status'] in ('Finalized','Unused','Void'):
+            raise PermissionError('This appraisal is locked')
+        if old['status']=='Submitted':
+            if newstatus=='Submitted':
+                if body.get('action')!='submit_revision' or requested_revision!=previous_revision+1:
+                    raise PermissionError('Submitted appraisal is locked; submit an explicit new revision')
+            elif any(k not in ('status','revisions') and v!=old.get(k) for k,v in updates.items()) or requested_revision!=previous_revision:
+                raise PermissionError('Finalization cannot change submitted appraisal details')
+        elif newstatus=='Submitted':
+            if requested_revision!=previous_revision+1:raise ValueError('Invalid submission revision')
+        elif requested_revision!=previous_revision:raise ValueError('Revision changes require submission')
+        updates['revisions']=requested_revision
         if 'data' in updates and (not isinstance(updates['data'],dict) or len(str(updates['data']))>250000):raise ValueError('Invalid form data')
         if 'store' in updates and updates['store'] not in STORES:raise ValueError('Invalid store')
         if u['role']!='System Admin' and 'store' in updates and updates['store'] not in u.get('locations',[]):raise PermissionError('Store is not assigned to user')
@@ -489,6 +505,6 @@ def retry_notification(record_id):
     return jsonify(notification=notify_export(r,rev,export['url'],pdf))
 
 @app.get('/api/health')
-def health():return jsonify(status='ok',environment='TEST',version='02.8')
+def health():return jsonify(status='ok',environment='TEST',version='02.9.1')
 
 if __name__=='__main__':app.run(host='0.0.0.0',port=int(os.getenv('PORT','8080')))
